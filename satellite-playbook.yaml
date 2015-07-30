@@ -1,0 +1,84 @@
+---
+- hosts: nodes
+  sudo: True
+  vars:
+    org_id: example
+    puppet_env: production
+
+  tasks:
+    # create dynamic groups to define variables
+    - group_by: key={{ ansible_distribution_major_version }}{{ ansible_lsb.id }}
+
+    - name: Unregister host
+      redhat_subscription: state=absent
+      ignore_errors: True
+
+    - name: Clean old subscription-manager data
+      shell: /usr/bin/subscription-manager clean
+
+    - name: Remove old satellite certs
+      yum: name=katello-ca-consumer-{{ groups['old_satellite'][0] }}
+        state=absent
+
+    - name: Install new satellite certs
+      shell: "/usr/bin/yum localinstall -e 0 -y http://{{ groups['satellite'][0] }}/pub/katello-ca-consumer-latest.noarch.rpm"
+      
+    - name: Subscribe to Satellite
+      shell: "/usr/bin/subscription-manager register --org {{ org_id }} --activationkey={{ activationkey }}"
+      register: subscription_result
+      ignore_errors: True
+
+    # sometimes nodes fail to unregister
+    - name: Force subscribe
+      shell: "/usr/bin/subscription-manager register --force --org {{ org_id }} --activationkey={{ activationkey }}"
+      when: "'Use --force' in subscription_result.stdout"
+
+    - name: Remove puppet certs
+      file: path=/var/lib/puppet/ssl
+        state=absent
+      tags: puppet
+
+    # Clean the old cert just in case
+    - name: clean old cert on puppet ca
+      shell: /usr/bin/puppet cert clean {{ ansible_fqdn }}
+      delegate_to: "{{ groups['puppet_ca'][0] }}"
+      ignore_errors: True
+      tags: puppet
+
+    - name: Update puppet conf ca
+      lineinfile: dest=/etc/puppet/puppet.conf
+        regexp="^\s*ca_server\s*="
+        line="ca_server = {{ groups['puppet_ca'][0] }}"
+      tags: puppet
+
+    - name: Update puppet conf server
+      lineinfile: dest=/etc/puppet/puppet.conf
+        regexp="^\s*server\s*="
+        line="server = {{ groups['puppet_master'][0] }}"
+      tags: puppet
+
+    - name: Update puppet environment
+      lineinfile: dest=/etc/puppet/puppet.conf
+        regexp="^\s*environment\s*="
+        line="environment = {{ puppet_env }}"
+      tags: puppet
+
+    - name: Kill existing puppet agent runs
+      command: /usr/bin/killall puppet
+      tags: puppet
+      ignore_errors: True
+
+    - name: Run puppet to cache certs
+      shell: /usr/bin/puppet agent -t
+      ignore_errors: True
+      tags: puppet
+
+    - name: sign puppet certificate
+      shell: /usr/bin/puppet cert sign {{ ansible_fqdn }}
+      delegate_to: "{{ groups['puppet_ca'][0] }}"
+      tags: puppet
+
+    - name: Run puppet again with valid cert
+      shell: /usr/bin/puppet agent -t
+      ignore_errors: True
+      tags: puppet
